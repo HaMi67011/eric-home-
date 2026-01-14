@@ -6,6 +6,7 @@ import requests
 import traceback
 import cv2
 import threading
+import subprocess
 
 from supabase import create_client, Client
 
@@ -22,6 +23,71 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
+# ---------------- Helper: Extract Audio from Video ----------------
+def extract_audio_from_video(video_bytes):
+    """Extract audio from video file using ffmpeg. Returns audio bytes or None if no audio."""
+    # Save video to temp file
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as video_tmp:
+        video_tmp.write(video_bytes)
+        video_tmp.flush()
+        video_path = video_tmp.name
+    
+    # Create temp file for audio output
+    audio_fd, audio_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(audio_fd)
+    
+    try:
+        # Use ffmpeg to extract audio
+        # -i: input file
+        # -vn: no video
+        # -acodec libmp3lame: use mp3 codec
+        # -ar 16000: sample rate 16kHz (good for Whisper)
+        # -ac 1: mono audio
+        # -b:a 64k: bitrate
+        print(f"Running ffmpeg: {video_path} -> {audio_path}")
+        result = subprocess.run(
+            [
+                "ffmpeg", "-i", video_path,
+                "-vn", "-acodec", "libmp3lame",
+                "-ar", "16000", "-ac", "1", "-b:a", "64k",
+                audio_path, "-y"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60
+        )
+        
+        # Log ffmpeg output for debugging
+        if result.returncode != 0:
+            print(f"ffmpeg error (return code {result.returncode}): {result.stderr.decode('utf-8', errors='ignore')[:500]}")
+        
+        # Check if audio file was created and has content
+        if os.path.exists(audio_path):
+            file_size = os.path.getsize(audio_path)
+            print(f"Audio file created: {file_size} bytes")
+            
+            if file_size > 1000:  # At least 1KB
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                return audio_bytes
+            else:
+                print("Audio file too small, likely no audio in video")
+                return None
+        else:
+            print("Audio file was not created")
+            return None
+            
+    except Exception as e:
+        print(f"Audio extraction error: {str(e)}")
+        print(traceback.format_exc())
+        return None
+    finally:
+        # Cleanup temp files
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
 # ---------------- Helper: Format Timestamp ----------------
 def format_timestamp(seconds):
     """Convert seconds (float) to H:M:S,ms format."""
@@ -33,14 +99,36 @@ def format_timestamp(seconds):
     return f"{h:02}:{m:02}:{s:02},{millis:03}"
 
 # ---------------- Transcribe Video via OpenAI HTTP ----------------
-def transcribe_video_verbose(file_bytes):
-    """Call OpenAI Whisper API with verbose_json to get segments with timestamps."""
-    if not file_bytes:
-        raise ValueError("Uploaded video/audio file is empty")
+def transcribe_video_verbose(video_bytes):
+    """
+    Extract audio from video and call OpenAI Whisper API with verbose_json.
+    Returns None if video has no audio.
+    """
+    if not video_bytes:
+        raise ValueError("Uploaded video file is empty")
+    
+    # Extract audio from video
+    print("Extracting audio from video...")
+    audio_bytes = extract_audio_from_video(video_bytes)
+    
+    if not audio_bytes:
+        print("No audio found in video")
+        return None
+    
+    print(f"Audio extracted: {len(audio_bytes)} bytes")
 
-    files = {"file": ("video.mp4", file_bytes)}
-    data = {"model": "whisper-1", "response_format": "verbose_json"}
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    # Send audio to OpenAI Whisper API
+    # Important: Use proper multipart/form-data format
+    files = {
+        "file": ("audio.mp3", audio_bytes, "audio/mpeg")
+    }
+    data = {
+        "model": "whisper-1",
+        "response_format": "verbose_json"
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
 
     response = requests.post(OPENAI_TRANSCRIPT_URL, headers=headers, files=files, data=data)
     if response.status_code != 200:
@@ -143,10 +231,17 @@ def upload_file():
             return jsonify({"error": "Uploaded video is empty"}), 400
 
         # ---------------- Transcription ----------------
+        timestamped_transcript = ""
         try:
             json_resp = transcribe_video_verbose(file_bytes)
-            segments = json_resp.get("segments", [])
-            timestamped_transcript = segments_to_timestamped_text(segments)
+            
+            # Check if video has audio
+            if json_resp is None:
+                timestamped_transcript = "[No audio found in video]"
+            else:
+                segments = json_resp.get("segments", [])
+                timestamped_transcript = segments_to_timestamped_text(segments)
+                
         except Exception as e:
             print("Transcription error:\n", traceback.format_exc())
             return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
