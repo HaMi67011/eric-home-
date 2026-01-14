@@ -150,13 +150,16 @@ def segments_to_timestamped_text(segments):
 # ---------------- Process frames + upload to Supabase ----------------
 def process_frames_and_upload(file_bytes, transcript_id):
     frames_metadata = []
-
+    
+    print(f"Frame extraction: Saving video to temp file...")
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp.write(file_bytes)
         tmp.flush()
         tmp_path = tmp.name
+    print(f"Frame extraction: Temp file created at {tmp_path}")
 
     try:
+        print(f"Frame extraction: Opening video with OpenCV...")
         cap = cv2.VideoCapture(tmp_path)
         if not cap.isOpened():
             raise RuntimeError("Failed to open video")
@@ -164,6 +167,8 @@ def process_frames_and_upload(file_bytes, transcript_id):
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = int(total_frames / fps)
+        
+        print(f"Frame extraction: Video info - FPS: {fps}, Total frames: {total_frames}, Duration: {duration}s")
 
         for sec in range(duration):
             cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
@@ -185,7 +190,8 @@ def process_frames_and_upload(file_bytes, transcript_id):
                     file_path, image_bytes, {"content-type": "image/jpeg"}
                 )
                 public_url = supabase.storage.from_("Ericc_video_frames").get_public_url(file_path)
-            except Exception:
+            except Exception as upload_error:
+                print(f"Frame upload error for {file_path}: {str(upload_error)}")
                 public_url = None
 
             frames_metadata.append({
@@ -195,21 +201,34 @@ def process_frames_and_upload(file_bytes, transcript_id):
             })
 
         cap.release()
+        print(f"Frame extraction: Successfully extracted {len(frames_metadata)} frames")
     finally:
-        os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+            print(f"Frame extraction: Cleaned up temp file")
 
     return frames_metadata
 
 # ---------------- Background Task for Frame Processing ----------------
 def background_frame_processing(file_bytes, transcript_id):
     """Process frames in the background to avoid blocking the request."""
+    print(f"Background: Starting frame processing for transcript {transcript_id}")
+    print(f"Background: Video bytes size: {len(file_bytes)}")
+    
     try:
         frames = process_frames_and_upload(file_bytes, transcript_id)
+        print(f"Background: Frame extraction completed. Found {len(frames)} frames")
+        
         if frames:
+            print(f"Background: Inserting {len(frames)} frames into database...")
             supabase.table("frame").insert(frames).execute()
-        print(f"Background: Processed {len(frames)} frames for transcript {transcript_id}")
+            print(f"Background: Successfully saved {len(frames)} frames for transcript {transcript_id}")
+        else:
+            print(f"Background: No frames extracted for transcript {transcript_id}")
+            
     except Exception as e:
-        print(f"Background frame processing error: {traceback.format_exc()}")
+        print(f"Background frame processing error for transcript {transcript_id}: {str(e)}")
+        print(f"Background error traceback:\n{traceback.format_exc()}")
 
 
 # ---------------- Upload Route ----------------
