@@ -1,9 +1,8 @@
-flask
-flask-cors
-openai-whisper
-torch
-numpy
+Flask
+Werkzeug
+requests
 opencv-python
 supabase
 python-dotenv
-
+gunicorn
+openai
