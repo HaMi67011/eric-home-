@@ -5,6 +5,7 @@ import tempfile
 import requests
 import traceback
 import cv2
+import threading
 
 from supabase import create_client, Client
 
@@ -111,6 +112,18 @@ def process_frames_and_upload(file_bytes, transcript_id):
 
     return frames_metadata
 
+# ---------------- Background Task for Frame Processing ----------------
+def background_frame_processing(file_bytes, transcript_id):
+    """Process frames in the background to avoid blocking the request."""
+    try:
+        frames = process_frames_and_upload(file_bytes, transcript_id)
+        if frames:
+            supabase.table("frame").insert(frames).execute()
+        print(f"Background: Processed {len(frames)} frames for transcript {transcript_id}")
+    except Exception as e:
+        print(f"Background frame processing error: {traceback.format_exc()}")
+
+
 # ---------------- Upload Route ----------------
 @app.route("/upload", methods=["POST"])
 def upload_file():
@@ -151,24 +164,18 @@ def upload_file():
 
         transcript_id = transcript_resp.data[0]["id"]
 
-        # ---------------- Process frames ----------------
-        frames = []
-        try:
-            frames = process_frames_and_upload(file_bytes, transcript_id)
-        except Exception as e:
-            print("Frame processing/upload error:\n", traceback.format_exc())
-
-        # ---------------- Insert frame metadata ----------------
-        if frames:
-            try:
-                supabase.table("frame").insert(frames).execute()
-            except Exception:
-                pass
+        # ---------------- Process frames in background ----------------
+        # Start frame processing in a background thread to avoid timeout
+        thread = threading.Thread(
+            target=background_frame_processing,
+            args=(file_bytes, transcript_id)
+        )
+        thread.daemon = True
+        thread.start()
 
         return jsonify({
-            "message": "Video processed successfully",
+            "message": "Video processed successfully. Frames are being extracted in the background.",
             "transcript_id": transcript_id,
-            "frame_count": len(frames),
             "transcript": timestamped_transcript
         })
 
