@@ -1,24 +1,28 @@
-from flask import Flask, request, jsonify
-import whisper
-from supabase import create_client, Client
+from flask import Flask, request, jsonify, render_template
+from werkzeug.exceptions import RequestEntityTooLarge
+import os
 import tempfile
-import cv2
-import numpy as np
+import requests
 import traceback
+import subprocess
+import glob
 
+from supabase import create_client, Client
+
+# ---------------- Flask App ----------------
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB max upload
 
-# ---------------- Supabase Connection ----------------
+# ---------------- Supabase ----------------
 SUPABASE_URL = "https://fmfanuooupxhecbmkkjp.supabase.co"
 SUPABASE_ANON_KEY = "sb_publishable_8ciah4qOvKKdACDVMUe4Yw_q8gwSAGN"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# ---------------- Load Whisper Model Once ----------------
-print("Loading Whisper model...")
-WHISPER_MODEL = whisper.load_model("base")
-print("Whisper model loaded.")
+# ---------------- OpenAI ----------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
-# ---------------- Helper: Format Timestamp ----------------
+# ---------------- Timestamp helper ----------------
 def format_timestamp(seconds):
     millis = int((seconds - int(seconds)) * 1000)
     seconds = int(seconds)
@@ -27,153 +31,126 @@ def format_timestamp(seconds):
     h = seconds // 3600
     return f"{h:02}:{m:02}:{s:02},{millis:03}"
 
-# ---------------- Whisper Transcription ----------------
-def transcribe_video(file_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
+# ---------------- Whisper ----------------
+def transcribe_video_verbose(file_bytes):
+    files = {"file": ("video.mp4", file_bytes)}
+    data = {"model": "whisper-1", "response_format": "verbose_json"}
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-        result = WHISPER_MODEL.transcribe(tmp.name)
+    r = requests.post(OPENAI_TRANSCRIPT_URL, headers=headers, files=files, data=data)
+    if r.status_code != 200:
+        raise ValueError(r.text)
 
-    transcript_lines = []
-    for segment in result.get("segments", []):
-        start = format_timestamp(segment["start"])
-        end = format_timestamp(segment["end"])
-        text = segment["text"].strip()
-        transcript_lines.append(f"[{start} --> {end}] {text}")
+    return r.json()
 
-    return "\n".join(transcript_lines)
+# ---------------- Transcript formatter ----------------
+def segments_to_timestamped_text(segments):
+    out = []
+    for seg in segments:
+        start = format_timestamp(seg["start"])
+        end = format_timestamp(seg["end"])
+        out.append(f"[{start} --> {end}] {seg['text'].strip()}")
+    return "\n".join(out)
 
-# ---------------- Frame Processing + Upload ----------------
+# ---------------- FFmpeg Frame Extraction ----------------
 def process_frames_and_upload(file_bytes, transcript_id):
-    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
+    frames = []
 
-        cap = cv2.VideoCapture(tmp.name)
-        if not cap.isOpened():
-            raise RuntimeError("Failed to open video")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = os.path.join(tmpdir, "video.mp4")
+        frames_dir = os.path.join(tmpdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = int(total_frames / fps)
+        with open(video_path, "wb") as f:
+            f.write(file_bytes)
 
-        frames_metadata = []
+        # Extract 1 frame per second
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-vf", "fps=1",
+            os.path.join(frames_dir, "frame_%04d.jpg")
+        ]
 
-        for sec in range(duration):
-            cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
-            ret, frame = cap.read()
-            if not ret:
-                print(f"Warning: Could not read frame at {sec}s")
-                continue
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            frame_ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        images = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
 
-            success, buffer = cv2.imencode(".jpg", frame)
-            if not success:
-                print(f"Warning: Could not encode frame at {sec}s")
-                continue
+        for i, img_path in enumerate(images):
+            with open(img_path, "rb") as f:
+                img_bytes = f.read()
 
-            image_bytes = buffer.tobytes()
-            file_path = f"{transcript_id}/frame_{sec}.jpg"
+            file_path = f"{transcript_id}/frame_{i}.jpg"
 
-            # Upload to Supabase storage with upsert=True to avoid conflicts
             try:
                 supabase.storage.from_("Ericc_video_frames").upload(
-                    file_path,
-                    image_bytes,
-                    {"content-type": "image/jpeg"}
+                    file_path, img_bytes, {"content-type": "image/jpeg"}
                 )
-            except Exception as e:
-                print(f"Error uploading frame {sec}: {e}")
-                continue
-
-            try:
                 public_url = supabase.storage.from_("Ericc_video_frames").get_public_url(file_path)
-                print(f"Public URL for frame {sec}: {public_url}")
-            except Exception as e:
-                print(f"Error getting public URL for frame {sec}: {e}")
+            except:
                 public_url = None
 
-            frames_metadata.append({
+            frames.append({
                 "transcript_id": transcript_id,
-                "frame_timestamp": frame_ts,
+                "frame_timestamp": i,
                 "frame_storage_url": public_url
             })
 
-            print(f"Uploaded frame @ {frame_ts:.3f}s")
+    return frames
 
-        cap.release()
-
-    return frames_metadata
-
-# ---------------- Upload Route ----------------
+# ---------------- Upload ----------------
 @app.route("/upload", methods=["POST"])
 def upload_file():
     try:
         name = request.form.get("name")
-        phone_str = request.form.get("phone")
-
-        try:
-            phone_num = int(phone_str)
-        except ValueError:
-            return jsonify({"error": "Invalid phone number"}), 400
-
+        phone = request.form.get("phone")
         file = request.files.get("video")
-        if not file:
-            return jsonify({"error": "No video file provided"}), 400
+
+        if not name or not phone or not file:
+            return jsonify({"error": "Missing data"}), 400
 
         file_bytes = file.read()
 
-        # 1️⃣ Transcribe
-        try:
-            transcript_text = transcribe_video(file_bytes)
-        except Exception as e:
-            print("Whisper transcription error:\n", traceback.format_exc())
-            return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
+        # Transcribe
+        whisper_json = transcribe_video_verbose(file_bytes)
+        segments = whisper_json.get("segments", [])
+        transcript = segments_to_timestamped_text(segments)
 
-        # 2️⃣ Insert transcript
-        transcript_payload = {
+        # Store transcript
+        resp = supabase.table("transcript").insert({
             "name": name,
-            "phoneNumber": phone_num,
-            "transcript": transcript_text
-        }
+            "phoneNumber": phone,
+            "transcript": transcript
+        }).execute()
 
-        transcript_resp = supabase.table("transcript").insert(transcript_payload).execute()
-        if not transcript_resp.data:
-            print("Transcript insert failed:", transcript_resp)
-            return jsonify({"error": "Failed to save transcript"}), 500
+        transcript_id = resp.data[0]["id"]
 
-        transcript_id = transcript_resp.data[0]["id"]
+        # Extract frames
+        frames = process_frames_and_upload(file_bytes, transcript_id)
 
-        # 3️⃣ Extract frames & upload
-        try:
-            frames = process_frames_and_upload(file_bytes, transcript_id)
-        except Exception as e:
-            print("Frame processing/upload error:\n", traceback.format_exc())
-            return jsonify({"error": f"Frame processing failed: {str(e)}"}), 500
-
-        # 4️⃣ Insert frame metadata
         if frames:
-            try:
-                frame_resp = supabase.table("frame").insert(frames).execute()
-                if not frame_resp.data:
-                    print("Frame insert failed:", frame_resp)
-                    return jsonify({"error": "Failed to save frames"}), 500
-            except Exception as e:
-                print("Supabase frame insert exception:\n", traceback.format_exc())
-                return jsonify({"error": f"Failed to save frames: {str(e)}"}), 500
+            supabase.table("frame").insert(frames).execute()
 
         return jsonify({
-            "message": "Video processed successfully",
+            "message": "Success",
             "transcript_id": transcript_id,
-            "frame_count": len(frames)
+            "frame_count": len(frames),
+            "transcript": transcript
         })
 
-    except Exception as e:
-        print("Unexpected exception:\n", traceback.format_exc())
-        return jsonify({"error": f"Upload or transcription failed: {str(e)}"}), 500
+    except Exception:
+        print(traceback.format_exc())
+        return jsonify({"error": "Processing failed"}), 500
 
-# ---------------- Run App ----------------
+# ---------------- Large files ----------------
+@app.errorhandler(RequestEntityTooLarge)
+def too_big(e):
+    return jsonify({"error": "File too large"}), 413
+
+# ---------------- Web ----------------
+@app.route("/")
+def home():
+    return render_template("main.html")
+
+# ---------------- Run ----------------
 if __name__ == "__main__":
     app.run(debug=True)
