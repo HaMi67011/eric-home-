@@ -19,7 +19,7 @@ SUPABASE_ANON_KEY = "sb_publishable_8ciah4qOvKKdACDVMUe4Yw_q8gwSAGN"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ---------------- OpenAI ----------------
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 # ---------------- Download Video ----------------
