@@ -5,91 +5,109 @@ import tempfile
 import requests
 import traceback
 import cv2
-
+import threading
+import subprocess
 from supabase import create_client, Client
 
 # ---------------- Flask App ----------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB max upload
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
 
-# ---------------- Supabase Connection ----------------
+# ---------------- Supabase ----------------
 SUPABASE_URL = "https://fmfanuooupxhecbmkkjp.supabase.co"
 SUPABASE_ANON_KEY = "sb_publishable_8ciah4qOvKKdACDVMUe4Yw_q8gwSAGN"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# ---------------- OpenAI Settings ----------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ---------------- OpenAI ----------------
+OPENAI_API_KEY = "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"
 OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
-# ---------------- Helper: Format Timestamp ----------------
-def format_timestamp(seconds):
-    millis = int((seconds - int(seconds)) * 1000)
-    seconds = int(seconds)
-    s = seconds % 60
-    m = (seconds // 60) % 60
-    h = seconds // 3600
-    return f"{h:02}:{m:02}:{s:02},{millis:03}"
-
-# ---------------- Download Video From URL ----------------
-def download_video_from_url(video_url):
-    # If video_url is a list (from GHL), take first element
-    if isinstance(video_url, list):
-        video_url = video_url[0]
-
+# ---------------- Download Video ----------------
+def download_video(video_url: str) -> bytes:
     if not video_url.startswith("http"):
         raise ValueError("Invalid video URL")
 
-    resp = requests.get(video_url, stream=True, timeout=30)
-    resp.raise_for_status()
-    return resp.content
+    r = requests.get(video_url, timeout=60)
+    r.raise_for_status()
 
-# ---------------- Transcribe Video ----------------
-def transcribe_video_verbose(file_bytes):
-    if not file_bytes:
-        raise ValueError("Video is empty")
+    if not r.content:
+        raise ValueError("Downloaded video is empty")
 
-    files = {"file": ("video.mp4", file_bytes)}
+    return r.content
+
+# ---------------- Timestamp ----------------
+def format_timestamp(seconds):
+    ms = int((seconds - int(seconds)) * 1000)
+    seconds = int(seconds)
+    return f"{seconds//3600:02}:{(seconds//60)%60:02}:{seconds%60:02},{ms:03}"
+
+# ---------------- Extract Audio ----------------
+def extract_audio_from_video(video_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
+        v.write(video_bytes)
+        video_path = v.name
+
+    fd, audio_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k", audio_path, "-y"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60
+        )
+
+        if result.returncode != 0:
+            return None
+
+        if os.path.getsize(audio_path) > 1000:
+            with open(audio_path, "rb") as f:
+                return f.read()
+
+        return None
+    finally:
+        os.remove(video_path)
+        os.remove(audio_path)
+
+# ---------------- Transcription ----------------
+def transcribe_video_verbose(video_bytes):
+    audio_bytes = extract_audio_from_video(video_bytes)
+    if not audio_bytes:
+        return None
+
+    files = {"file": ("audio.mp3", audio_bytes, "audio/mpeg")}
     data = {"model": "whisper-1", "response_format": "verbose_json"}
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
-    response = requests.post(
-        OPENAI_TRANSCRIPT_URL,
-        headers=headers,
-        files=files,
-        data=data,
-        timeout=120
+    r = requests.post(OPENAI_TRANSCRIPT_URL, headers=headers, files=files, data=data)
+    if r.status_code != 200:
+        raise RuntimeError(r.text)
+
+    return r.json()
+
+def segments_to_text(segments):
+    return "\n".join(
+        f"[{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}] {s['text'].strip()}"
+        for s in segments
     )
 
-    response.raise_for_status()
-    return response.json()
+# ---------------- Frame Extraction (1/sec) ----------------
+def process_frames_and_upload(video_bytes, transcript_id):
+    frames = []
 
-# ---------------- Convert Segments ----------------
-def segments_to_timestamped_text(segments):
-    lines = []
-    for seg in segments:
-        start = format_timestamp(seg["start"])
-        end = format_timestamp(seg["end"])
-        text = seg["text"].strip()
-        lines.append(f"[{start} --> {end}] {text}")
-    return "\n".join(lines)
-
-# ---------------- Process Frames ----------------
-def process_frames_and_upload(file_bytes, transcript_id):
-    frames_metadata = []
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp.write(file_bytes)
-        tmp.flush()
-        video_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
+        v.write(video_bytes)
+        path = v.name
 
     try:
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            raise RuntimeError("Cannot open video")
+            return []
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = int(total_frames / fps)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = int(total / fps)
 
         for sec in range(duration):
             cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
@@ -97,98 +115,95 @@ def process_frames_and_upload(file_bytes, transcript_id):
             if not ret:
                 continue
 
-            ts = round(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000, 3)
-            success, buffer = cv2.imencode(".jpg", frame)
-            if not success:
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
                 continue
 
-            image_bytes = buffer.tobytes()
-            path = f"{transcript_id}/frame_{sec}.jpg"
+            file_path = f"{transcript_id}/frame_{sec}.jpg"
 
             try:
                 supabase.storage.from_("Ericc_video_frames").upload(
-                    path,
-                    image_bytes,
-                    {"content-type": "image/jpeg"}
+                    file_path, buf.tobytes(), {"content-type": "image/jpeg"}
                 )
-                url = supabase.storage.from_("Ericc_video_frames").get_public_url(path)
+                url = supabase.storage.from_("Ericc_video_frames").get_public_url(file_path)
             except Exception:
                 url = None
 
-            frames_metadata.append({
+            frames.append({
                 "transcript_id": transcript_id,
-                "frame_timestamp": ts,
+                "frame_timestamp": sec,
                 "frame_storage_url": url
             })
 
         cap.release()
     finally:
-        os.remove(video_path)
+        os.remove(path)
 
-    return frames_metadata
+    return frames
 
-# ---------------- Upload Route (API Only) ----------------
-@app.route("/upload", methods=["POST"])
-def upload_file():
+# ---------------- Background Worker ----------------
+def background_frame_processing(video_bytes, transcript_id):
     try:
-        # Accept JSON or form-data
-        data = request.get_json() if request.is_json else request.form
-
-        name = data.get("full_name") or data.get("first_name")
-        phone = data.get("phone")
-        video_url = data.get("video")
-        file = request.files.get("video")
-
-        if not name or not phone:
-            return jsonify({"error": "Name and phone are required"}), 400
-
-        # --- Get video bytes ---
-        if file:
-            file_bytes = file.read()
-        elif video_url:
-            file_bytes = download_video_from_url(video_url)
-        else:
-            return jsonify({"error": "No video or video_url provided"}), 400
-
-        if not file_bytes:
-            return jsonify({"error": "Video is empty"}), 400
-
-        # --- Transcription ---
-        json_resp = transcribe_video_verbose(file_bytes)
-        segments = json_resp.get("segments", [])
-        transcript_text = segments_to_timestamped_text(segments)
-
-        # --- Save transcript ---
-        transcript_payload = {
-            "name": name,
-            "phoneNumber": str(phone),
-            "transcript": transcript_text
-        }
-
-        transcript_resp = supabase.table("transcript").insert(transcript_payload).execute()
-        transcript_id = transcript_resp.data[0]["id"]
-
-        # --- Process frames ---
-        frames = process_frames_and_upload(file_bytes, transcript_id)
+        frames = process_frames_and_upload(video_bytes, transcript_id)
         if frames:
             supabase.table("frame").insert(frames).execute()
+    except Exception:
+        print(traceback.format_exc())
+
+# ---------------- Upload API ----------------
+@app.route("/upload", methods=["POST"])
+def upload():
+    try:
+        data = request.get_json(force=True)
+
+        name = data.get("full_name") or data.get("first_name")
+        phone = data.get("phone") or data.get("Phone Number")
+        video_url = data.get("customData", {}).get("video") or data.get("uploadvideolink")
+
+        if not name or not phone or not video_url:
+            return jsonify({"error": "Name, phone, and video are required"}), 400
+
+        video_bytes = download_video(video_url)
+
+        transcript_text = "[No audio found]"
+        json_resp = transcribe_video_verbose(video_bytes)
+        if json_resp:
+            transcript_text = segments_to_text(json_resp.get("segments", []))
+
+        resp = supabase.table("transcript").insert({
+            "name": name,
+            "phoneNumber": phone,
+            "transcript": transcript_text
+        }).execute()
+
+        if not resp.data:
+            return jsonify({"error": "Transcript save failed"}), 500
+
+        transcript_id = resp.data[0]["id"]
+
+        threading.Thread(
+            target=background_frame_processing,
+            args=(video_bytes, transcript_id),
+            daemon=True
+        ).start()
 
         return jsonify({
-            "message": "Video processed successfully",
+            "success": True,
             "transcript_id": transcript_id,
-            "frame_count": len(frames),
-            "transcript": transcript_text
-        })
+            "frame_status": "processing",
+#            "transcript": transcript_text
+        }), 200
 
-    except Exception as e:
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception:
         print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
-# ---------------- Error: File Too Large ----------------
+# ---------------- Errors ----------------
 @app.errorhandler(RequestEntityTooLarge)
-def handle_large_file(e):
-    return jsonify({"error": "File too large. Max 15MB."}), 413
+def large_file(e):
+    return jsonify({"error": "File too large (15MB max)"}), 413
 
-# ---------------- Run API ----------------
 if __name__ == "__main__":
     app.run(debug=True)
