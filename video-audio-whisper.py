@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify
-from werkzeug.exceptions import RequestEntityTooLarge
 import os
 import tempfile
 import requests
@@ -8,19 +7,33 @@ import cv2
 import threading
 import subprocess
 from supabase import create_client, Client
+from dotenv import load_dotenv 
 
 # ---------------- Flask App ----------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
 
 # ---------------- Supabase ----------------
-SUPABASE_URL = "https://fmfanuooupxhecbmkkjp.supabase.co"
-SUPABASE_ANON_KEY = "sb_publishable_8ciah4qOvKKdACDVMUe4Yw_q8gwSAGN"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+
 
 # ---------------- OpenAI ----------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
+
+
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("Supabase credentials not found in environment variables")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set in environment variables")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
 
 # ---------------- Download Video ----------------
 def download_video(video_url: str) -> bytes:
@@ -92,7 +105,7 @@ def segments_to_text(segments):
         for s in segments
     )
 
-# ---------------- Frame Extraction (1/sec) ----------------
+# ---------------- Frame Extraction ----------------
 def process_frames_and_upload(video_bytes, transcript_id):
     frames = []
 
@@ -156,42 +169,63 @@ def upload():
     try:
         data = request.get_json(force=True)
 
+        # Extract name and phone
         name = data.get("full_name") or data.get("first_name")
         phone = data.get("phone") or data.get("Phone Number")
-        video_url = data.get("customData", {}).get("video") or data.get("uploadvideolink")
 
-        if not name or not phone or not video_url:
-            return jsonify({"error": "Name, phone, and video are required"}), 400
+        # Extract all video URLs
+        video_urls = data.get("Video Upload")
 
-        video_bytes = download_video(video_url)
+        # Normalize to list
+        if not video_urls:
+            video_urls = []
+        elif isinstance(video_urls, str):
+            video_urls = [video_urls]
 
-        transcript_text = "[No audio found]"
-        json_resp = transcribe_video_verbose(video_bytes)
-        if json_resp:
-            transcript_text = segments_to_text(json_resp.get("segments", []))
+        if not name or not phone or not video_urls:
+            return jsonify({"error": "Name, phone, and at least one video are required"}), 400
 
-        resp = supabase.table("transcript").insert({
-            "name": name,
-            "phoneNumber": phone,
-            "transcript": transcript_text
-        }).execute()
+        transcript_ids = []
 
-        if not resp.data:
-            return jsonify({"error": "Transcript save failed"}), 500
+        for idx, video_url in enumerate(video_urls, start=1):
+            try:
+                video_bytes = download_video(video_url)
 
-        transcript_id = resp.data[0]["id"]
+                # Transcribe video
+                transcript_text = "[No audio found]"
+                json_resp = transcribe_video_verbose(video_bytes)
+                if json_resp:
+                    transcript_text = segments_to_text(json_resp.get("segments", []))
 
-        threading.Thread(
-            target=background_frame_processing,
-            args=(video_bytes, transcript_id),
-            daemon=True
-        ).start()
+                # Save transcript
+                resp = supabase.table("transcript").insert({
+                    "name": name,
+                    "phoneNumber": phone,
+                    "transcript": transcript_text,
+                    "uploadNumber": idx
+                }).execute()
+
+                if resp.data:
+                    transcript_id = resp.data[0]["id"]
+                    transcript_ids.append(transcript_id)
+
+                    # Start frame extraction in background
+                    threading.Thread(
+                        target=background_frame_processing,
+                        args=(video_bytes, transcript_id),
+                        daemon=True
+                    ).start()
+                else:
+                    print(f"Failed to save transcript for video {idx}: {video_url}")
+
+            except Exception as e:
+                print(f"Failed to process video {idx}: {video_url}\nError: {e}")
 
         return jsonify({
             "success": True,
-            "transcript_id": transcript_id,
-            "frame_status": "processing",
-#            "transcript": transcript_text
+            "transcripts_processed": len(transcript_ids),
+            "transcript_ids": transcript_ids,
+            "frame_status": "processing"
         }), 200
 
     except ValueError as ve:
@@ -200,10 +234,6 @@ def upload():
         print(traceback.format_exc())
         return jsonify({"error": "Internal server error"}), 500
 
-# ---------------- Errors ----------------
-@app.errorhandler(RequestEntityTooLarge)
-def large_file(e):
-    return jsonify({"error": "File too large (15MB max)"}), 413
-
+# ---------------- Run App ----------------
 if __name__ == "__main__":
     app.run(debug=True)
