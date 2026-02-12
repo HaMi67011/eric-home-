@@ -22,35 +22,23 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_TRANSCRIPT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Supabase credentials not found")
-
+    raise RuntimeError("Supabase credentials missing")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not found")
+    raise RuntimeError("OPENAI_API_KEY missing")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ---------------- Helpers ----------------
 
-def download_video(video_url: str) -> bytes:
-    if not video_url.startswith("http"):
-        raise ValueError("Invalid video URL")
-
-    r = requests.get(video_url, timeout=60)
+def download_file(url: str) -> tuple[bytes, str]:
+    r = requests.get(url, timeout=60, stream=True)
     r.raise_for_status()
+    return r.content, r.headers.get("Content-Type", "").lower()
 
-    if not r.content:
-        raise ValueError("Downloaded video is empty")
+def is_image_content(content_type: str) -> bool:
+    return content_type.startswith("image/")
 
-    return r.content
-
-
-def format_timestamp(seconds: float) -> str:
-    ms = int((seconds - int(seconds)) * 1000)
-    seconds = int(seconds)
-    return f"{seconds//3600:02}:{(seconds//60)%60:02}:{seconds%60:02},{ms:03}"
-
-
-def extract_audio_from_video(video_bytes: bytes) -> bytes | None:
+def extract_audio(video_bytes: bytes) -> bytes | None:
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
         v.write(video_bytes)
         video_path = v.name
@@ -60,104 +48,88 @@ def extract_audio_from_video(video_bytes: bytes) -> bytes | None:
 
     try:
         result = subprocess.run(
-            [
-                "ffmpeg", "-i", video_path,
-                "-vn", "-ac", "1", "-ar", "16000",
-                "-b:a", "64k", audio_path, "-y"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=60
+            ["ffmpeg", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", audio_path, "-y"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30
         )
-
-        if result.returncode != 0:
+        if result.returncode != 0 or os.path.getsize(audio_path) < 1000:
             return None
 
-        if os.path.getsize(audio_path) > 1000:
-            with open(audio_path, "rb") as f:
-                return f.read()
-
-        return None
-
+        with open(audio_path, "rb") as f:
+            return f.read()
     finally:
         os.remove(video_path)
         os.remove(audio_path)
 
-
-def transcribe_video_verbose(video_bytes: bytes) -> dict | None:
-    audio_bytes = extract_audio_from_video(video_bytes)
-    if not audio_bytes:
+def transcribe(video_bytes: bytes) -> dict | None:
+    audio = extract_audio(video_bytes)
+    if not audio:
         return None
 
-    files = {
-        "file": ("audio.mp3", audio_bytes, "audio/mpeg")
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    files = {"file": ("audio.mp3", audio, "audio/mpeg")}
+    data = {"model": "whisper-1", "response_format": "verbose_json"}
 
-    data = {
-        "model": "whisper-1",
-        "response_format": "verbose_json"
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
-    }
-
-    r = requests.post(
-        OPENAI_TRANSCRIPT_URL,
-        headers=headers,
-        files=files,
-        data=data
-    )
-
+    r = requests.post(OPENAI_TRANSCRIPT_URL, headers=headers, files=files, data=data)
     if r.status_code != 200:
-        raise RuntimeError(r.text)
-
+        return None
     return r.json()
 
-
-def segments_to_text(segments: list) -> str:
-    return "\n".join(
-        f"[{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}] {s['text'].strip()}"
-        for s in segments
-    )
-
-
 def get_next_upload_number() -> int:
-    resp = (
-        supabase
-        .table("transcript")
-        .select("uploadNumber")
-        .is_("uploadNumber", "not_null")  # ✅ underscore, not dot
-        .order("uploadNumber", desc=True)
-        .limit(1)
-        .execute()
-    )
+    r = supabase.table("transcript").select("uploadNumber").order(
+        "uploadNumber", desc=True
+    ).limit(1).execute()
+    return (r.data[0]["uploadNumber"] + 1) if r.data else 1
 
-    if resp.data:
-        return int(resp.data[0]["uploadNumber"]) + 1
+# ---------------- Frame Storage ----------------
 
-    return 1
+def save_frame(frame_bytes: bytes, transcript_id: int, timestamp: int):
+    path = f"{transcript_id}/frame_{timestamp}.jpg"
 
-
-
-# ---------------- Frame Processing ----------------
-
-def process_frames_and_upload(video_bytes: bytes, transcript_id: int) -> list:
-    frames = []
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
-        v.write(video_bytes)
-        video_path = v.name
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp.write(frame_bytes)
+        tmp_path = tmp.name
 
     try:
-        cap = cv2.VideoCapture(video_path)
+        supabase.storage.from_("Ericc_video_frames").upload(
+            path, tmp_path, {"content-type": "image/jpeg"}
+        )
+
+        url = supabase.storage.from_("Ericc_video_frames").get_public_url(path)
+        if isinstance(url, dict):
+            url = url.get("publicUrl")
+
+        supabase.table("frame").insert({
+            "transcript_id": transcript_id,
+            "frame_timestamp": timestamp,
+            "frame_storage_url": url
+        }).execute()
+
+        print(f"[OK] Frame saved → transcript {transcript_id}")
+
+    except Exception as e:
+        print("[FRAME ERROR]", e)
+
+    finally:
+        os.remove(tmp_path)
+
+def process_video_frames(video_bytes: bytes, transcript_id: int):
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
+        v.write(video_bytes)
+        path = v.name
+
+    try:
+        cap = cv2.VideoCapture(path)
         if not cap.isOpened():
-            return []
+            print("Video open failed")
+            return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = int(total_frames / fps)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = max(1, int(frames / fps))
 
+        saved = False
         for sec in range(duration):
             cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
             ret, frame = cap.read()
@@ -165,43 +137,20 @@ def process_frames_and_upload(video_bytes: bytes, transcript_id: int) -> list:
                 continue
 
             ok, buf = cv2.imencode(".jpg", frame)
-            if not ok:
-                continue
+            if ok:
+                save_frame(buf.tobytes(), transcript_id, sec)
+                saved = True
 
-            storage_path = f"{transcript_id}/frame_{sec}.jpg"
-
-            try:
-                supabase.storage.from_("Ericc_video_frames").upload(
-                    storage_path,
-                    buf.tobytes(),
-                    {"content-type": "image/jpeg"}
-                )
-
-                url = supabase.storage.from_("Ericc_video_frames").get_public_url(storage_path)
-            except Exception:
-                url = None
-
-            frames.append({
-                "transcript_id": transcript_id,
-                "frame_timestamp": sec,
-                "frame_storage_url": url
-            })
+        if not saved:
+            ret, frame = cap.read()
+            if ret:
+                ok, buf = cv2.imencode(".jpg", frame)
+                if ok:
+                    save_frame(buf.tobytes(), transcript_id, 0)
 
         cap.release()
-
     finally:
-        os.remove(video_path)
-
-    return frames
-
-
-def background_frame_processing(video_bytes: bytes, transcript_id: int):
-    try:
-        frames = process_frames_and_upload(video_bytes, transcript_id)
-        if frames:
-            supabase.table("frame").insert(frames).execute()
-    except Exception:
-        print(traceback.format_exc())
+        os.remove(path)
 
 # ---------------- Upload API ----------------
 
@@ -212,73 +161,64 @@ def upload():
 
         name = data.get("full_name") or data.get("first_name")
         phone = data.get("phone") or data.get("Phone Number")
-        video_urls = data.get("Video Upload")
-        full_address = data.get("full_address")
-        city = data.get("city")              
-        state = data.get("state")            
-        country = data.get("country")        
+        files = data.get("File Upload") or data.get("Video Upload")
 
-        
+        if not name or not phone or not files:
+            return jsonify({"error": "Missing fields"}), 400
 
-        if not video_urls:
-            video_urls = []
-        elif isinstance(video_urls, str):
-            video_urls = [video_urls]
+        if isinstance(files, str):
+            files = [files]
 
-        if not name or not phone or not video_urls:
-            return jsonify({"error": "Name, phone, and at least one video are required"}), 400
-
-        # 🔹 One global uploadNumber for this request
         upload_number = get_next_upload_number()
-
         transcript_ids = []
 
-        for video_url in video_urls:
-            try:
-                video_bytes = download_video(video_url)
+        for url in files:
+            file_bytes, content_type = download_file(url)
+            is_image = is_image_content(content_type)
 
-                transcript_text = "[No audio found]"
-                json_resp = transcribe_video_verbose(video_bytes)
-                if json_resp:
-                    transcript_text = segments_to_text(json_resp.get("segments", []))
+            transcript = "[Image uploaded]" if is_image else "[No audio found]"
 
-                resp = supabase.table("transcript").insert({
-                    "name": name,
-                    "phoneNumber": phone,
-                    "transcript": transcript_text,
-                    "uploadNumber": upload_number,
-                    "address": full_address,
-                    "city": city,
-                    "state": state,
-                    "country": country
-                }).execute()
+            resp = supabase.table("transcript").insert({
+                "name": name,
+                "phoneNumber": phone,
+                "transcript": transcript,
+                "uploadNumber": upload_number
+            }).execute()
 
-                if resp.data:
-                    transcript_id = resp.data[0]["id"]
-                    transcript_ids.append(transcript_id)
+            transcript_id = resp.data[0]["id"]
+            transcript_ids.append(transcript_id)
 
-                    threading.Thread(
-                        target=background_frame_processing,
-                        args=(video_bytes, transcript_id),
-                        daemon=True
-                    ).start()
+            if is_image:
+                save_frame(file_bytes, transcript_id, 0)
+            else:
+                try:
+                    result = transcribe(file_bytes)
+                    if result:
+                        text = "\n".join(
+                            s["text"].strip() for s in result.get("segments", [])
+                        )
+                        supabase.table("transcript").update(
+                            {"transcript": text}
+                        ).eq("id", transcript_id).execute()
+                except Exception:
+                    pass
 
-            except Exception as e:
-                print(f"Failed to process video: {video_url}\n{e}")
+                threading.Thread(
+                    target=process_video_frames,
+                    args=(file_bytes, transcript_id),
+                    daemon=True
+                ).start()
 
         return jsonify({
             "success": True,
             "uploadNumber": upload_number,
-            "transcripts_processed": len(transcript_ids),
-            "transcript_ids": transcript_ids,
-            "frame_status": "processing"
-        }), 200
+            "transcript_ids": transcript_ids
+        })
 
     except Exception:
         print(traceback.format_exc())
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": "Server error"}), 500
 
-# ---------------- Run App ----------------
-
+# ---------------- Run ----------------
 if __name__ == "__main__":
     app.run(debug=True)
