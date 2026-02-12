@@ -213,6 +213,12 @@ def upload():
         name = data.get("full_name") or data.get("first_name")
         phone = data.get("phone") or data.get("Phone Number")
         video_urls = data.get("Video Upload")
+        full_address = data.get("full_address")
+        city = data.get("city")              
+        state = data.get("state")            
+        country = data.get("country")        
+
+        
 
         if not video_urls:
             video_urls = []
@@ -240,7 +246,11 @@ def upload():
                     "name": name,
                     "phoneNumber": phone,
                     "transcript": transcript_text,
-                    "uploadNumber": upload_number
+                    "uploadNumber": upload_number,
+                    "address": full_address,
+                    "city": city,
+                    "state": state,
+                    "country": country
                 }).execute()
 
                 if resp.data:
