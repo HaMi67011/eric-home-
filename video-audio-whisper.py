@@ -30,6 +30,13 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ---------------- Helpers ----------------
 
+def format_timestamp(seconds: float) -> str:
+    total_ms = int(seconds * 1000)
+    ms = total_ms % 1000
+    s = total_ms // 1000
+    return f"{s//3600:02}:{(s//60)%60:02}:{s%60:02},{ms:03}"
+
+
 def download_file(url: str) -> tuple[bytes, str]:
     r = requests.get(url, timeout=60, stream=True)
     r.raise_for_status()
@@ -38,32 +45,72 @@ def download_file(url: str) -> tuple[bytes, str]:
 def is_image_content(content_type: str) -> bool:
     return content_type.startswith("image/")
 
-def extract_audio(video_bytes: bytes) -> bytes | None:
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
-        v.write(video_bytes)
-        video_path = v.name
-
-    fd, audio_path = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd)
-
+def extract_audio_from_video(video_bytes):
+    """Extract audio from video file using ffmpeg. Returns audio bytes or None if no audio."""
+    # Save video to temp file
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as video_tmp:
+        video_tmp.write(video_bytes)
+        video_tmp.flush()
+        video_path = video_tmp.name
+    
+    # Create temp file for audio output
+    audio_fd, audio_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(audio_fd)
+    
     try:
+        # Use ffmpeg to extract audio
+        # -i: input file
+        # -vn: no video
+        # -acodec libmp3lame: use mp3 codec
+        # -ar 16000: sample rate 16kHz (good for Whisper)
+        # -ac 1: mono audio
+        # -b:a 64k: bitrate
+        print(f"Running ffmpeg: {video_path} -> {audio_path}")
         result = subprocess.run(
-            ["ffmpeg", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", audio_path, "-y"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=30
+            [
+                "ffmpeg", "-i", video_path,
+                "-vn", "-acodec", "libmp3lame",
+                "-ar", "16000", "-ac", "1", "-b:a", "64k",
+                audio_path, "-y"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60
         )
-        if result.returncode != 0 or os.path.getsize(audio_path) < 1000:
+        
+        # Log ffmpeg output for debugging
+        if result.returncode != 0:
+            print(f"ffmpeg error (return code {result.returncode}): {result.stderr.decode('utf-8', errors='ignore')[:500]}")
+        
+        # Check if audio file was created and has content
+        if os.path.exists(audio_path):
+            file_size = os.path.getsize(audio_path)
+            print(f"Audio file created: {file_size} bytes")
+            
+            if file_size > 1000:  # At least 1KB
+                with open(audio_path, "rb") as f:
+                    audio_bytes = f.read()
+                return audio_bytes
+            else:
+                print("Audio file too small, likely no audio in video")
+                return None
+        else:
+            print("Audio file was not created")
             return None
-
-        with open(audio_path, "rb") as f:
-            return f.read()
+            
+    except Exception as e:
+        print(f"Audio extraction error: {str(e)}")
+        print(traceback.format_exc())
+        return None
     finally:
-        os.remove(video_path)
-        os.remove(audio_path)
+        # Cleanup temp files
+        if os.path.exists(video_path):
+            os.remove(video_path)
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
 
 def transcribe(video_bytes: bytes) -> dict | None:
-    audio = extract_audio(video_bytes)
+    audio = extract_audio_from_video(video_bytes)
     if not audio:
         return None
 
@@ -153,12 +200,12 @@ def process_video_frames(video_bytes: bytes, transcript_id: int):
         os.remove(path)
 
 # ---------------- Upload API ----------------
-
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
         data = request.get_json(force=True)
 
+        # ---------------- Extract fields ----------------
         name = data.get("full_name") or data.get("first_name")
         phone = data.get("phone") or data.get("Phone Number")
         files = data.get("File Upload") or data.get("Video Upload")
@@ -176,16 +223,34 @@ def upload():
         upload_number = get_next_upload_number()
         transcript_ids = []
 
+        # ---------------- Process each file ----------------
         for url in files:
+            # Download file bytes
             file_bytes, content_type = download_file(url)
             is_image = is_image_content(content_type)
 
-            transcript = "[Image uploaded]" if is_image else "[No audio found]"
+            # Default transcript
+            transcript_text = "[Image uploaded]" if is_image else "[No audio found]"
 
+            # ---------------- Transcribe if video ----------------
+            if not is_image:
+                try:
+                    result = transcribe(file_bytes)
+                    if result and result.get("segments"):
+                        transcript_text = "\n".join(
+                            f"[{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}] {s['text'].strip()}"
+                            for s in result["segments"]
+                        )
+                except Exception as e:
+                    print("Transcription error:", e)
+                    print(traceback.format_exc())
+                    # fallback transcript_text remains
+
+            # ---------------- Insert transcript into Supabase ----------------
             resp = supabase.table("transcript").insert({
                 "name": name,
                 "phoneNumber": phone,
-                "transcript": transcript,
+                "transcript": transcript_text,
                 "uploadNumber": upload_number,
                 "address": full_address,
                 "city": city,
@@ -196,27 +261,17 @@ def upload():
             transcript_id = resp.data[0]["id"]
             transcript_ids.append(transcript_id)
 
+            # ---------------- Save frames ----------------
             if is_image:
                 save_frame(file_bytes, transcript_id, 0)
             else:
-                try:
-                    result = transcribe(file_bytes)
-                    if result:
-                        text = "\n".join(
-                            s["text"].strip() for s in result.get("segments", [])
-                        )
-                        supabase.table("transcript").update(
-                            {"transcript": text}
-                        ).eq("id", transcript_id).execute()
-                except Exception:
-                    pass
-
                 threading.Thread(
                     target=process_video_frames,
                     args=(file_bytes, transcript_id),
                     daemon=True
                 ).start()
 
+        # ---------------- Return response ----------------
         return jsonify({
             "success": True,
             "uploadNumber": upload_number,
