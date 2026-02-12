@@ -162,6 +162,10 @@ def upload():
         name = data.get("full_name") or data.get("first_name")
         phone = data.get("phone") or data.get("Phone Number")
         files = data.get("File Upload") or data.get("Video Upload")
+        full_address = data.get("full_address")
+        city = data.get("city")
+        state = data.get("state")
+        country = data.get("country")
 
         if not name or not phone or not files:
             return jsonify({"error": "Missing fields"}), 400
@@ -182,7 +186,11 @@ def upload():
                 "name": name,
                 "phoneNumber": phone,
                 "transcript": transcript,
-                "uploadNumber": upload_number
+                "uploadNumber": upload_number,
+                "address": full_address,
+                "city": city,
+                "state": state,
+                "country": country
             }).execute()
 
             transcript_id = resp.data[0]["id"]
